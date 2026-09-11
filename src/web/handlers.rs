@@ -117,15 +117,10 @@ pub async fn get_user_stats(
     Query(range_params): Query<LogRangeParams>,
     app: State<App>,
 ) -> Result<Json<UserLogsStats>> {
-    let (channel_id, user_id) = resolve_user_params(&user_params, &app).await?;
+    let (channel_id, user_id, user_login) = resolve_user_params(&user_params, &app).await?;
 
     app.check_opted_out(&channel_id, Some(&user_id))?;
 
-    let user_login = app
-        .get_users(vec![user_id.clone()], vec![], false)
-        .await?
-        .into_values()
-        .next();
     let stats = db::get_user_stats(&app.db, &channel_id, user_id, user_login, range_params).await?;
 
     Ok(Json(stats))
@@ -190,15 +185,18 @@ pub async fn get_user_logs(
     RawQuery(query): RawQuery,
     app: State<App>,
 ) -> Result<impl IntoApiResponse> {
-    let (channel_id, user_id) = resolve_user_params(&user_params, &app).await?;
+    let (channel_id, user_id, user_login) = resolve_user_params(&user_params, &app).await?;
 
     app.check_opted_out(&channel_id, Some(&user_id))?;
 
     if let Some(range) = range_params.range() {
-        let logs = get_user_logs_inner(&app, &channel_id, &user_id, logs_params, range).await?;
+        let logs =
+            get_user_logs_inner(&app, &channel_id, &user_id, &user_login, logs_params, range)
+                .await?;
         Ok(logs.into_response())
     } else {
-        let available_logs = read_available_user_logs(&app.db, &channel_id, &user_id).await?;
+        let available_logs =
+            read_available_user_logs(&app.db, &channel_id, &user_id, &user_login).await?;
         let latest_log = available_logs.first().ok_or(Error::NotFound)?;
 
         let UserLogPathParams {
@@ -224,7 +222,7 @@ pub async fn get_user_logs_by_date(
     Path(user_logs_date): Path<UserLogsDatePath>,
     Query(logs_params): Query<LogsParams>,
 ) -> Result<impl IntoApiResponse> {
-    let (channel_id, user_id) = resolve_user_params(&user_params, &app).await?;
+    let (channel_id, user_id, user_login) = resolve_user_params(&user_params, &app).await?;
 
     app.check_opted_out(&channel_id, Some(&user_id))?;
 
@@ -239,13 +237,22 @@ pub async fn get_user_logs_by_date(
         .checked_add_months(Months::new(1))
         .ok_or_else(|| Error::InvalidParam("Date out of range".to_owned()))?;
 
-    get_user_logs_inner(&app, &channel_id, &user_id, logs_params, (from, to)).await
+    get_user_logs_inner(
+        &app,
+        &channel_id,
+        &user_id,
+        &user_login,
+        logs_params,
+        (from, to),
+    )
+    .await
 }
 
 async fn get_user_logs_inner(
     app: &App,
     channel_id: &str,
     user_id: &str,
+    user_login: &str,
     logs_params: LogsParams,
     range: (DateTime<Utc>, DateTime<Utc>),
 ) -> Result<impl IntoApiResponse> {
@@ -253,6 +260,7 @@ async fn get_user_logs_inner(
         &app.db,
         channel_id,
         user_id,
+        user_login,
         logs_params,
         &app.flush_buffer,
         range,
@@ -283,12 +291,19 @@ pub async fn list_available_logs(
     };
 
     let available_logs = if let Some(user) = user {
-        let user_id = match user {
-            UserParam::UserId(id) => id,
-            UserParam::User(name) => app.get_user_id_by_name(&name).await?,
+        let (user_id, user_login) = match user {
+            UserParam::UserId(id) => {
+                let users = app.get_users(vec![id.clone()], vec![], false).await?;
+                let user_login = users.get(&id).cloned().unwrap_or_default();
+                (id, user_login)
+            }
+            UserParam::User(name) => {
+                let user_id = app.get_user_id_by_name(&name).await?;
+                (user_id, name.to_ascii_lowercase())
+            }
         };
         app.check_opted_out(&channel_id, Some(&user_id))?;
-        read_available_user_logs(&app.db, &channel_id, &user_id).await?
+        read_available_user_logs(&app.db, &channel_id, &user_id, &user_login).await?
     } else {
         app.check_opted_out(&channel_id, None)?;
         read_available_channel_logs(&app.db, &channel_id).await?
@@ -329,11 +344,11 @@ pub async fn random_user_line(
     Path(user_params): Path<UserLogPathParams>,
     Query(logs_params): Query<LogsParams>,
 ) -> Result<impl IntoApiResponse> {
-    let (channel_id, user_id) = resolve_user_params(&user_params, &app).await?;
+    let (channel_id, user_id, user_login) = resolve_user_params(&user_params, &app).await?;
 
     app.check_opted_out(&channel_id, Some(&user_id))?;
 
-    let random_line = read_random_user_line(&app.db, &channel_id, &user_id).await?;
+    let random_line = read_random_user_line(&app.db, &channel_id, &user_id, &user_login).await?;
     let stream = LogsStream::new_provided(vec![random_line])?;
 
     let logs = LogsResponse {
@@ -349,7 +364,7 @@ pub async fn search_user_logs(
     Query(search_params): Query<SearchParams>,
     Query(logs_params): Query<LogsParams>,
 ) -> Result<impl IntoApiResponse> {
-    let (channel_id, user_id) = resolve_user_params(&user_params, &app).await?;
+    let (channel_id, user_id, user_login) = resolve_user_params(&user_params, &app).await?;
 
     app.check_opted_out(&channel_id, Some(&user_id))?;
 
@@ -357,6 +372,7 @@ pub async fn search_user_logs(
         &app.db,
         &channel_id,
         &user_id,
+        &user_login,
         &search_params.q,
         logs_params,
     )
@@ -412,14 +428,29 @@ pub fn no_cache_header() -> TypedHeader<CacheControl> {
     TypedHeader(CacheControl::new().with_no_cache())
 }
 
-async fn resolve_user_params(params: &UserLogPathParams, app: &App) -> Result<(String, String)> {
+async fn resolve_user_params(
+    params: &UserLogPathParams,
+    app: &App,
+) -> Result<(String, String, String)> {
     let channel_id = match params.channel_id_type {
         ChannelIdType::Name => app.get_user_id_by_name(&params.channel).await?,
         ChannelIdType::Id => params.channel.clone(),
     };
-    let user_id = match params.user_id_type {
-        UserIdType::Name => app.get_user_id_by_name(&params.user).await?,
-        UserIdType::Id => params.user.clone(),
+    let (user_id, user_login) = match params.user_id_type {
+        UserIdType::Name => (
+            app.get_user_id_by_name(&params.user).await?,
+            params.user.to_ascii_lowercase(),
+        ),
+        UserIdType::Id => {
+            let user_id = params.user.clone();
+            let user_login = app
+                .get_users(vec![user_id.clone()], vec![], false)
+                .await?
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_default();
+            (user_id, user_login)
+        }
     };
-    Ok((channel_id, user_id))
+    Ok((channel_id, user_id, user_login))
 }

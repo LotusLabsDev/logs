@@ -23,6 +23,8 @@ use schema::StructuredMessage;
 use tracing::debug;
 
 const CHANNEL_MULTI_QUERY_SIZE_DAYS: i64 = 14;
+// Imported Chatterino logs do not have a Twitch user ID, but preserve the login.
+const USER_MATCH: &str = "(user_id = ? OR (user_id = '' AND user_login != '' AND user_login = ?))";
 
 pub async fn read_channel(
     db: &Client,
@@ -110,6 +112,7 @@ pub async fn read_user(
     db: &Client,
     channel_id: &str,
     user_id: &str,
+    user_login: &str,
     params: LogsParams,
     flush_buffer: &FlushBuffer,
     (from, to): (DateTime<Utc>, DateTime<Utc>),
@@ -118,13 +121,14 @@ pub async fn read_user(
         FlushBufferResponse::new(flush_buffer, channel_id, Some(user_id), params, (from, to)).await;
 
     let suffix = if params.reverse { "DESC" } else { "ASC" };
-    let mut query = format!("SELECT * FROM message_structured WHERE channel_id = ? AND user_id = ? AND timestamp >= ? AND timestamp < ? ORDER BY timestamp {suffix}");
+    let mut query = format!("SELECT * FROM message_structured WHERE channel_id = ? AND {USER_MATCH} AND timestamp >= ? AND timestamp < ? ORDER BY timestamp {suffix}");
     apply_limit_offset(&mut query, &buffer_response);
 
     let cursor = db
         .query(&query)
         .bind(channel_id)
         .bind(user_id)
+        .bind(user_login)
         .bind(from.timestamp_millis() as f64 / 1000.0)
         .bind(to.timestamp_millis() as f64 / 1000.0)
         .fetch()?;
@@ -162,12 +166,16 @@ pub async fn read_available_user_logs(
     db: &Client,
     channel_id: &str,
     user_id: &str,
+    user_login: &str,
 ) -> Result<Vec<AvailableLogDate>> {
+    let query = format!("SELECT toDateTime(toStartOfMonth(timestamp)) AS date FROM message_structured WHERE channel_id = ? AND {USER_MATCH} GROUP BY date ORDER BY date DESC");
     let timestamps: Vec<i32> = db
-        .query("SELECT toDateTime(toStartOfMonth(timestamp)) AS date FROM message_structured WHERE channel_id = ? AND user_id = ? GROUP BY date ORDER BY date DESC")
+        .query(&query)
         .bind(channel_id)
         .bind(user_id)
-        .fetch_all().await?;
+        .bind(user_login)
+        .fetch_all()
+        .await?;
 
     let dates = timestamps
         .into_iter()
@@ -189,11 +197,15 @@ pub async fn read_random_user_line(
     db: &Client,
     channel_id: &str,
     user_id: &str,
+    user_login: &str,
 ) -> Result<StructuredMessage<'static>> {
+    let count_query =
+        format!("SELECT count(*) FROM message_structured WHERE channel_id = ? AND {USER_MATCH}");
     let total_count = db
-        .query("SELECT count(*) FROM message_structured WHERE channel_id = ? AND user_id = ? ")
+        .query(&count_query)
         .bind(channel_id)
         .bind(user_id)
+        .bind(user_login)
         .fetch_one::<u64>()
         .await?;
 
@@ -206,18 +218,21 @@ pub async fn read_random_user_line(
         (0..total_count).choose(&mut rng).ok_or(Error::NotFound)
     }?;
 
-    let msg = db
-        .query(
-            "WITH
-            (SELECT timestamp FROM message_structured WHERE channel_id = ? AND user_id = ? LIMIT 1 OFFSET ?)
+    let random_query = format!(
+        "WITH
+            (SELECT timestamp FROM message_structured WHERE channel_id = ? AND {USER_MATCH} LIMIT 1 OFFSET ?)
             AS random_timestamp
-            SELECT * FROM message_structured WHERE channel_id = ? AND user_id = ? AND timestamp = random_timestamp",
-        )
+            SELECT * FROM message_structured WHERE channel_id = ? AND {USER_MATCH} AND timestamp = random_timestamp"
+    );
+    let msg = db
+        .query(&random_query)
         .bind(channel_id)
         .bind(user_id)
+        .bind(user_login)
         .bind(offset)
         .bind(channel_id)
         .bind(user_id)
+        .bind(user_login)
         .fetch_optional::<StructuredMessage>()
         .await?
         .ok_or(Error::NotFound)?;
@@ -274,6 +289,7 @@ pub async fn search_user_logs(
     db: &Client,
     channel_id: &str,
     user_id: &str,
+    user_login: &str,
     search: &str,
     params: LogsParams,
 ) -> Result<LogsStream> {
@@ -281,13 +297,14 @@ pub async fn search_user_logs(
 
     let suffix = if params.reverse { "DESC" } else { "ASC" };
 
-    let mut query = format!("SELECT * FROM message_structured WHERE channel_id = ? AND user_id = ? AND positionCaseInsensitive(text, ?) != 0 ORDER BY timestamp {suffix}");
+    let mut query = format!("SELECT * FROM message_structured WHERE channel_id = ? AND {USER_MATCH} AND positionCaseInsensitive(text, ?) != 0 ORDER BY timestamp {suffix}");
     apply_limit_offset(&mut query, &buffer_response);
 
     let cursor = db
         .query(&query)
         .bind(channel_id)
         .bind(user_id)
+        .bind(user_login)
         .bind(search)
         .fetch()?;
 
@@ -347,17 +364,21 @@ pub async fn get_user_stats(
     db: &Client,
     channel_id: &str,
     user_id: String,
-    user_login: Option<String>,
+    user_login: String,
     range_params: LogRangeParams,
 ) -> Result<UserLogsStats> {
     let mut query =
-        "SELECT count(*) FROM message_structured WHERE channel_id = ? AND user_id = ?".to_owned();
+        format!("SELECT count(*) FROM message_structured WHERE channel_id = ? AND {USER_MATCH}");
 
     if range_params.range().is_some() {
         query.push_str(" AND timestamp >= ? AND timestamp < ?");
     }
 
-    let mut query = db.query(&query).bind(channel_id).bind(&user_id);
+    let mut query = db
+        .query(&query)
+        .bind(channel_id)
+        .bind(&user_id)
+        .bind(&user_login);
 
     if let Some((from, to)) = range_params.range() {
         query = query
@@ -369,7 +390,7 @@ pub async fn get_user_stats(
 
     Ok(UserLogsStats {
         message_count: count,
-        user_login,
+        user_login: (!user_login.is_empty()).then_some(user_login),
         user_id,
     })
 }
@@ -421,5 +442,18 @@ fn apply_limit_offset(query: &mut String, buffer_response: &FlushBufferResponse)
     }
     if let Some(offset) = buffer_response.normalized_offset() {
         *query = format!("{query} OFFSET {offset}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USER_MATCH;
+
+    #[test]
+    fn user_match_keeps_live_ids_and_imported_logins() {
+        assert_eq!(
+            USER_MATCH,
+            "(user_id = ? OR (user_id = '' AND user_login != '' AND user_login = ?))"
+        );
     }
 }
